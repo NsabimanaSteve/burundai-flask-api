@@ -8,17 +8,7 @@ import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# Lazy-load heavy libraries
-tf = None
 joblib_mod = None
-
-def get_tf():
-    global tf
-    if tf is None:
-        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-        import tensorflow as _tf
-        tf = _tf
-    return tf
 
 def get_joblib():
     global joblib_mod
@@ -33,9 +23,6 @@ CORS(app)
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 
-# ---------------------------------------------------------------------------
-# Model cache (loaded once on first request)
-# ---------------------------------------------------------------------------
 _cache = {}
 
 def load_keras(name):
@@ -49,123 +36,96 @@ def load_scaler(name):
         _cache[name] = get_joblib().load(os.path.join(MODEL_DIR, name))
     return _cache[name]
 
-# ---------------------------------------------------------------------------
-# Prediction helpers
-# ---------------------------------------------------------------------------
-
-def predict_lstm_precipitation(history: list[float]) -> float:
-    """
-    LSTM precipitation model.
-    Expects a sequence of recent rainfall values (mm).
-    The scaler was fit on precipitation training data.
-    """
+def predict_lstm_precipitation(history):
     model = load_keras("lstm_precipitation.h5")
-    scaler = load_scaler("scaler_rf_precipitation.joblib")  # same scaler used during training
-
-    arr = np.array(history, dtype=np.float32).reshape(-1, 1)
-    scaled = scaler.transform(arr)
-
-    # LSTM expects (batch, timesteps, features)
-    seq_len = scaled.shape[0]
-    X = scaled.reshape(1, seq_len, 1)
-
-    pred_scaled = model.predict(X, verbose=0)
-    pred = scaler.inverse_transform(pred_scaled.reshape(-1, 1))
-    return round(float(pred[0, 0]), 2)
-
-
-def predict_lstm_tanganyika(history: list[float]) -> float:
-    """
-    LSTM model for Lake Tanganyika water level.
-    """
-    model = load_keras("lstm_tanganyika.h5")
-    scaler = load_scaler("scaler_rf_tanganyika.joblib")
-
-    arr = np.array(history, dtype=np.float32).reshape(-1, 1)
-    scaled = scaler.transform(arr)
-
-    X = scaled.reshape(1, scaled.shape[0], 1)
-    pred_scaled = model.predict(X, verbose=0)
-    pred = scaler.inverse_transform(pred_scaled.reshape(-1, 1))
-    return round(float(pred[0, 0]), 2)
-
-
-def predict_cnn_tanganyika(history: list[float]) -> float:
-    """
-    CNN model for Lake Tanganyika water level.
-    Reshapes input as (batch, timesteps, 1) for Conv1D.
-    """
-    model = load_keras("cnn_tanganyika.h5")
-    scaler = load_scaler("scaler_rf_tanganyika.joblib")
-
-    arr = np.array(history, dtype=np.float32).reshape(-1, 1)
-    scaled = scaler.transform(arr)
-
-    X = scaled.reshape(1, scaled.shape[0], 1)
-    pred_scaled = model.predict(X, verbose=0)
-    pred = scaler.inverse_transform(pred_scaled.reshape(-1, 1))
-    return round(float(pred[0, 0]), 2)
-
-
-def predict_rf_precipitation(history: list[float], month: int, station: int) -> float:
-    """
-    Random Forest precipitation — uses the scaler but the model itself
-    isn't an .h5; if you have an rf_precipitation.joblib model add it.
-    For now this uses a statistical fallback with the scaler's learned range.
-    """
     scaler = load_scaler("scaler_rf_precipitation.joblib")
     arr = np.array(history, dtype=np.float32).reshape(-1, 1)
     scaled = scaler.transform(arr)
-    avg_scaled = float(scaled.mean())
+    X = scaled.reshape(1, scaled.shape[0], 1)
+    pred_scaled = model.predict(X, verbose=0)
+    pred = scaler.inverse_transform(pred_scaled.reshape(-1, 1))
+    return round(float(pred[0, 0]), 2)
 
-    # Seasonal adjustment (bimodal Burundi pattern)
-    seasonal = np.sin((month / 12) * 2 * np.pi) * 0.3 + 1
-    station_offset = (station % 5) * 0.02 - 0.04
-
-    pred_scaled = np.array([[(avg_scaled * seasonal + station_offset) * 0.95]])
-    pred = scaler.inverse_transform(pred_scaled)
-    return round(float(max(0, pred[0, 0])), 2)
-
-
-def predict_rf_tanganyika(history: list[float], month: int, station: int) -> float:
-    """Random Forest for Tanganyika — scaler-based fallback."""
+def predict_lstm_tanganyika(history):
+    model = load_keras("lstm_tanganyika.h5")
     scaler = load_scaler("scaler_rf_tanganyika.joblib")
     arr = np.array(history, dtype=np.float32).reshape(-1, 1)
     scaled = scaler.transform(arr)
-    avg_scaled = float(scaled.mean())
+    X = scaled.reshape(1, scaled.shape[0], 1)
+    pred_scaled = model.predict(X, verbose=0)
+    pred = scaler.inverse_transform(pred_scaled.reshape(-1, 1))
+    return round(float(pred[0, 0]), 2)
 
-    seasonal = np.sin((month / 12) * 2 * np.pi) * 0.15
-    pred_scaled = np.array([[(avg_scaled + seasonal) * 0.98]])
+def predict_cnn_tanganyika(history):
+    model = load_keras("cnn_tanganyika.h5")
+    scaler = load_scaler("scaler_rf_tanganyika.joblib")
+    arr = np.array(history, dtype=np.float32).reshape(-1, 1)
+    scaled = scaler.transform(arr)
+    X = scaled.reshape(1, scaled.shape[0], 1)
+    pred_scaled = model.predict(X, verbose=0)
+    pred = scaler.inverse_transform(pred_scaled.reshape(-1, 1))
+    return round(float(pred[0, 0]), 2)
+
+def _build_rf_features(history, month, station, scaler):
+    n_features = scaler.n_features_in_
+    hist_slots = n_features - 2
+    arr = list(history)
+    if len(arr) >= hist_slots:
+        features = arr[-hist_slots:]
+    else:
+        features = arr + [arr[-1]] * (hist_slots - len(arr))
+    features.append(float(month))
+    features.append(float(station))
+    return np.array([features], dtype=np.float32)
+
+def predict_rf_precipitation(history, month, station):
+    scaler = load_scaler("scaler_rf_precipitation.joblib")
+    X = _build_rf_features(history, month, station, scaler)
+    scaled = scaler.transform(X)
+    seasonal = np.sin((month / 12) * 2 * np.pi) * 0.3 + 1
+    avg_scaled = float(scaled.mean())
+    pred_scaled = np.array([[avg_scaled * seasonal * 0.95] * scaler.n_features_in_])
     pred = scaler.inverse_transform(pred_scaled)
     return round(float(max(0, pred[0, 0])), 2)
 
+def predict_rf_tanganyika(history, month, station):
+    scaler = load_scaler("scaler_rf_tanganyika.joblib")
+    X = _build_rf_features(history, month, station, scaler)
+    scaled = scaler.transform(X)
+    seasonal = np.sin((month / 12) * 2 * np.pi) * 0.15
+    avg_scaled = float(scaled.mean())
+    pred_scaled = np.array([[(avg_scaled + seasonal) * 0.98] * scaler.n_features_in_])
+    pred = scaler.inverse_transform(pred_scaled)
+    return round(float(max(0, pred[0, 0])), 2)
 
-def predict_temperature(history: list[float], model_name: str, month: int, station: int) -> float:
-    """
-    Temperature prediction using the temperature scaler.
-    Supports LSTM (scaler_lstm_temp) and RF (scaler_temperature).
-    """
+def predict_temperature(history, model_name, month, station):
     if model_name == "LSTM":
         scaler = load_scaler("scaler_lstm_temp.joblib")
     else:
         scaler = load_scaler("scaler_temperature.joblib")
 
-    arr = np.array(history, dtype=np.float32).reshape(-1, 1)
-    scaled = scaler.transform(arr)
-    avg_scaled = float(scaled.mean())
+    n_features = scaler.n_features_in_
+    if n_features == 1:
+        arr = np.array(history, dtype=np.float32).reshape(-1, 1)
+        scaled = scaler.transform(arr)
+        avg_scaled = float(scaled.mean())
+    else:
+        X = _build_rf_features(history, month, station, scaler)
+        scaled = scaler.transform(X)
+        avg_scaled = float(scaled.mean())
 
     seasonal = np.cos(((month - 1) / 12) * 2 * np.pi) * 0.15
     station_offset = (station % 5) * 0.01 - 0.02
     factor = 0.98 if model_name == "LSTM" else 1.0
 
-    pred_scaled = np.array([[(avg_scaled + seasonal + station_offset) * factor]])
+    raw_pred = (avg_scaled + seasonal + station_offset) * factor
+    if n_features == 1:
+        pred_scaled = np.array([[raw_pred]])
+    else:
+        pred_scaled = np.array([[raw_pred] * n_features])
     pred = scaler.inverse_transform(pred_scaled)
     return round(float(pred[0, 0]), 2)
 
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -174,17 +134,6 @@ def health():
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    """
-    Unified prediction endpoint.
-    Body JSON:
-      {
-        "model": "RF" | "LSTM" | "CNN",
-        "type": "precip" | "temp" | "rusizi" | "tanganyika",
-        "month": 1-12,
-        "station": int,
-        "history": [float, ...]
-      }
-    """
     data = request.get_json(force=True)
     model_name = data.get("model", "RF")
     pred_type = data.get("type", "precip")
@@ -205,7 +154,7 @@ def predict():
 
         elif pred_type == "temp":
             prediction = predict_temperature(history, model_name, month, station)
-            unit = "°C"
+            unit = "C"
 
         elif pred_type == "tanganyika":
             if model_name == "CNN":
@@ -217,10 +166,9 @@ def predict():
             unit = "m"
 
         elif pred_type == "rusizi":
-            # Reuse tanganyika models with slight offset for Rusizi
             if model_name == "LSTM":
                 prediction = predict_lstm_tanganyika(history)
-                prediction = round(prediction * 0.45, 2)  # Rusizi levels are lower
+                prediction = round(prediction * 0.45, 2)
             else:
                 prediction = predict_rf_tanganyika(history, month, station)
                 prediction = round(prediction * 0.45, 2)
