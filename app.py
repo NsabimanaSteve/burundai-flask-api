@@ -40,7 +40,8 @@ _cache = {}
 
 def load_keras(name):
     if name not in _cache:
-        _cache[name] = get_tf().keras.models.load_model(os.path.join(MODEL_DIR, name))
+        import keras
+        _cache[name] = keras.models.load_model(os.path.join(MODEL_DIR, name))
     return _cache[name]
 
 def load_scaler(name):
